@@ -79,7 +79,7 @@ def load_assets_for_symbol(symbol: str):
         return  # sudah pernah di-load
 
     # --- path file ---
-    model_path = os.path.join(MODELS_DIR, f"{symbol}.h5")
+    model_path = os.path.join(MODELS_DIR, f"{symbol}_best.h5")
     feat_scaler_path = os.path.join(SCALERS_DIR, f"{symbol}_feature_scaler.pkl")
     target_scaler_path = os.path.join(SCALERS_DIR, f"{symbol}_close_scaler.pkl")
     feature_cols_path = os.path.join(SCALERS_DIR, f"{symbol}_feature_cols.pkl")
