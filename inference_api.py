@@ -98,8 +98,8 @@ def load_assets_for_symbol(symbol: str):
     feature_scalers[symbol] = joblib.load(feat_scaler_path)
     target_scalers[symbol] = joblib.load(target_scaler_path)
 
-    with open(feature_cols_path, "r") as f:
-        feature_cols_map[symbol] = json.load(f)
+    #  pakai joblib.load
+    feature_cols_map[symbol] = joblib.load(feature_cols_path)
 
 
 # =========================
