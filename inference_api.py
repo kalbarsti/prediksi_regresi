@@ -36,7 +36,7 @@ close_scalers = {}
 feature_cols_map = {}
 
 for name in TICKERS:
-    models[name] = load_model(f"{MODELS_DIR}/{name}.h5")
+    models[name] = load_model(f"{MODELS_DIR}/{name}_best.h5")
     feature_scalers[name] = joblib.load(f"{SCALERS_DIR}/{name}_feature_scaler.pkl")
     close_scalers[name] = joblib.load(f"{SCALERS_DIR}/{name}_close_scaler.pkl")
     feature_cols_map[name] = joblib.load(f"{SCALERS_DIR}/{name}_feature_cols.pkl")
