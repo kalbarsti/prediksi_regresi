@@ -237,21 +237,40 @@ def predict_symbol(symbol):
 
 
 # =========================
+# HISTORY
+# =========================
+
 @app.route("/history/<symbol>", methods=["GET"])
 def history(symbol):
-    symbol = symbol.upper()
-    ticker_yf = symbol + ".JK"
+    try:
+        symbol = symbol.upper()
+        if symbol not in SUPPORTED_SYMBOLS:
+            return jsonify({"error": f"Symbol {symbol} tidak didukung. Gunakan {SUPPORTED_SYMBOLS}"}), 400
 
-    df = yf.download(ticker_yf, period="2y", auto_adjust=False).dropna()
-    if df.empty:
-        return jsonify({"error": f"Tidak ada data untuk {ticker_yf}"}), 500
+        ticker_yf = symbol + ".JK"
+        df = yf.download(ticker_yf, period="2y", auto_adjust=False, progress=False)
 
-    df = df.reset_index()
-    dates = df["Date"].dt.strftime("%Y-%m-%d").tolist()
-    close = df["Close"].tolist()
+        if df is None or df.empty:
+            return jsonify({"error": f"Tidak ada data untuk {ticker_yf}"}), 500
 
-    return jsonify({"symbol": symbol, "dates": dates, "close": close})
-# =========================
+        # Kalau kolom MultiIndex, rapikan
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df.dropna()
+
+        # Ambil tanggal dari index (paling aman)
+        dates = df.index.strftime("%Y-%m-%d").tolist()
+
+        # Close harus float biasa
+        close = df["Close"].astype(float).tolist()
+
+        return jsonify({"symbol": symbol, "dates": dates, "close": close})
+
+    except Exception as e:
+        # supaya kalau error, keluar JSON bukan HTML
+        return jsonify({"error": str(e)}), 500
+
 
 # =========================
 # ENTRY POINT (LOCAL)
