@@ -1,4 +1,5 @@
 from flask import Flask, jsonify
+from flask_cors import CORS
 import pandas as pd
 import yfinance as yf
 
@@ -67,6 +68,7 @@ def generate_trading_days(start_date: dt.date, n_days: int, holidays=None):
 # =========================
 
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 models = {}
 feature_scalers = {}
