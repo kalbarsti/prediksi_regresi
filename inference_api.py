@@ -1,3 +1,23 @@
+from flask import Flask, jsonify
+import pandas as pd
+import yfinance as yf
+
+@app.route("/history/<symbol>", methods=["GET"])
+def history(symbol):
+    symbol = symbol.upper()
+    ticker_yf = symbol + ".JK"
+
+    df = yf.download(ticker_yf, period="2y", auto_adjust=False).dropna()
+    if df.empty:
+        return jsonify({"error": f"Tidak ada data untuk {ticker_yf}"}), 500
+
+    df = df.reset_index()
+    dates = df["Date"].dt.strftime("%Y-%m-%d").tolist()
+    close = df["Close"].tolist()
+
+    return jsonify({"symbol": symbol, "dates": dates, "close": close})
+
+
 import os
 import json
 import datetime as dt
