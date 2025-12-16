@@ -166,6 +166,76 @@ def forecast_future(
     ]
     return results
 
+# =================
+# backtest 1 bulan
+# =================
+
+def backtest_last_month(
+    df: pd.DataFrame,
+    feature_scaler,
+    target_scaler,
+    model,
+    feature_cols,
+    lookback: int = LOOKBACK,
+    backtest_days: int = 22,  # ±1 bulan bursa
+):
+    """
+    Rolling 1-step forecast untuk ±1 bulan terakhir.
+    Untuk setiap tanggal t:
+    - input = data sampai t-1
+    - output = prediksi Close untuk t
+    """
+
+    df_feat = df[feature_cols].copy()
+    scaled_features = feature_scaler.transform(df_feat.values)
+
+    close_idx = feature_cols.index("Close")
+
+    if len(df_feat) < lookback + backtest_days:
+        raise ValueError("Data historis tidak cukup untuk backtest")
+
+    preds = []
+    dates = []
+    actuals = []
+
+    start_i = len(df_feat) - backtest_days
+
+    for i in range(start_i, len(df_feat)):
+        window = scaled_features[i - lookback : i, :]
+        x_in = window[np.newaxis, ...]  # (1, lookback, n_features)
+
+        y_scaled = model.predict(x_in, verbose=0)
+        y_pred = target_scaler.inverse_transform(y_scaled)[0, 0]
+
+        preds.append(float(y_pred))
+        actuals.append(float(df["Close"].iloc[i]))
+        dates.append(df.index[i].strftime("%Y-%m-%d"))
+
+    return {
+        "dates": dates,
+        "predicted_close": preds,
+        "actual_close": actuals,
+    }
+
+# ========================
+# Helper Metriks
+# ========================
+def compute_metrics(actual: np.ndarray, pred: np.ndarray):
+    actual = np.asarray(actual, dtype=float)
+    pred = np.asarray(pred, dtype=float)
+
+    # MAE
+    mae = float(np.mean(np.abs(actual - pred)))
+
+    # RMSE
+    rmse = float(np.sqrt(np.mean((actual - pred) ** 2)))
+
+    # MAPE (hindari div 0)
+    eps = 1e-9
+    mape = float(np.mean(np.abs((actual - pred) / np.maximum(np.abs(actual), eps))) * 100.0)
+
+    return {"mae": mae, "rmse": rmse, "mape": mape}
+
 
 # =========================
 # ROUTES FLASK
@@ -271,6 +341,105 @@ def history(symbol):
 
     except Exception as e:
         # supaya kalau error, keluar JSON bukan HTML
+        return jsonify({"error": str(e)}), 500
+
+# =========================
+# Backtest
+# =========================
+@app.route("/backtest/<symbol>", methods=["GET"])
+def backtest(symbol):
+    try:
+        symbol = symbol.upper()
+        if symbol not in SUPPORTED_SYMBOLS:
+            return jsonify({"error": f"Symbol {symbol} tidak didukung"}), 400
+
+        load_assets_for_symbol(symbol)
+
+        model = models[symbol]
+        feat_scaler = feature_scalers[symbol]
+        tgt_scaler = target_scalers[symbol]
+        feature_cols = feature_cols_map[symbol]
+
+        ticker_yf = symbol + ".JK"
+        df = yf.download(ticker_yf, period="5y", auto_adjust=False, progress=False)
+        df = df.dropna()
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+
+        result = backtest_last_month(
+            df=df,
+            feature_scaler=feat_scaler,
+            target_scaler=tgt_scaler,
+            model=model,
+            feature_cols=feature_cols,
+            lookback=LOOKBACK,
+            backtest_days=22,
+        )
+
+        return jsonify({
+            "symbol": symbol,
+            "days": len(result["dates"]),
+            **result
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ========================
+# Metriks Symbols
+# ========================
+@app.route("/metrics/<symbol>", methods=["GET"])
+def metrics(symbol):
+    try:
+        symbol = symbol.upper()
+        if symbol not in SUPPORTED_SYMBOLS:
+            return jsonify({"error": f"Symbol {symbol} tidak didukung. Gunakan {SUPPORTED_SYMBOLS}"}), 400
+
+        # load model & scaler
+        load_assets_for_symbol(symbol)
+        model = models[symbol]
+        feat_scaler = feature_scalers[symbol]
+        tgt_scaler = target_scalers[symbol]
+        feature_cols = feature_cols_map[symbol]
+
+        # ambil data historis untuk backtest
+        ticker_yf = symbol + ".JK"
+        df = yf.download(ticker_yf, period="5y", auto_adjust=False, progress=False).dropna()
+
+        if df is None or df.empty:
+            return jsonify({"error": f"Tidak ada data untuk {ticker_yf}"}), 500
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+
+        # rolling backtest 1 bulan (±22 hari bursa)
+        bt = backtest_last_month(
+            df=df,
+            feature_scaler=feat_scaler,
+            target_scaler=tgt_scaler,
+            model=model,
+            feature_cols=feature_cols,
+            lookback=LOOKBACK,
+            backtest_days=22,
+        )
+
+        metrics_dict = compute_metrics(
+            actual=np.array(bt["actual_close"], dtype=float),
+            pred=np.array(bt["predicted_close"], dtype=float),
+        )
+
+        return jsonify({
+            "symbol": symbol,
+            "window_days": bt["days"] if "days" in bt else len(bt["dates"]),
+            "metrics": metrics_dict,
+            # opsional: kalau mau lihat detailnya juga
+            # "dates": bt["dates"],
+            # "actual_close": bt["actual_close"],
+            # "predicted_close": bt["predicted_close"],
+        })
+
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
