@@ -1,10 +1,7 @@
 from flask import Flask, jsonify
 from flask_cors import CORS
-import pandas as pd
-import yfinance as yf
 
 import os
-import json
 import datetime as dt
 
 import numpy as np
@@ -12,43 +9,27 @@ import pandas as pd
 import yfinance as yf
 import joblib
 
-from flask import Flask, jsonify
 from tensorflow.keras.models import load_model
 
-# =========================
-# KONFIGURASI DASAR
-# =========================
+# Konfigurasi dasar
 
-# Folder model & scaler (relatif terhadap root project)
 MODELS_DIR = "models"
 SCALERS_DIR = "scalers"
 
-# Ticker yang di-support
 SUPPORTED_SYMBOLS = ["BBCA", "BBRI", "BBNI", "BMRI"]
-
-# Lookback window (HARUS sama dengan waktu training)
-LOOKBACK = 60
-
-# Banyak hari prediksi default
+LOOKBACK = 60  
 DEFAULT_FORECAST_DAYS = int(os.environ.get("FORECAST_DAYS", 7))
 
-# =========================
-# KALENDER HARI BURSA IDX
-# =========================
-
-# hari libur BEI (opsional)
-# Format: dt.date(tahun, bulan, hari)
+# Kalender hari bursa
 ID_HOLIDAYS = {
-    # Contoh:
-    # dt.date(2025, 1, 1),   # Tahun Baru
-    # dt.date(2025, 3, 31),  # Libur keagamaan (contoh)
+    # dt.date(2025, 1, 1),
 }
 
 def generate_trading_days(start_date: dt.date, n_days: int, holidays=None):
     """
-    Menghasilkan n_days tanggal HARI BURSA setelah start_date:
-    - Hanya Senin–Jumat (weekday 0–4)
-    - Tidak termasuk tanggal di 'holidays'
+    Menghasilkan n_days tanggal hari bursa setelah start_date:
+    - Senin–Jumat
+    - Holidays
     """
     if holidays is None:
         holidays = set()
@@ -57,60 +38,45 @@ def generate_trading_days(start_date: dt.date, n_days: int, holidays=None):
     current = start_date
     while len(dates) < n_days:
         current += dt.timedelta(days=1)
-        # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
         if current.weekday() < 5 and current not in holidays:
             dates.append(current)
     return dates
 
 
-# =========================
-# LOAD MODEL & SCALER
-# =========================
+# APP
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-models = {}
-feature_scalers = {}
-target_scalers = {}
-feature_cols_map = {}
-
+# cache (untuk lazy load)
+_models = {}
+_feature_scalers = {}
+_target_scalers = {}
+_feature_cols_map = {}
 
 def load_assets_for_symbol(symbol: str):
-    """
-    Lazy load: model, scaler, dan daftar kolom fitur untuk 1 saham.
-    Dipanggil pertama kali saat /predict/<symbol>.
-    """
-    if symbol in models:
-        return  # sudah pernah di-load
+    """Lazy load model dan scaler untuk 1 saham"""
+    if symbol in _models:
+        return
 
-    # --- path file ---
     model_path = os.path.join(MODELS_DIR, f"{symbol}_best.h5")
     feat_scaler_path = os.path.join(SCALERS_DIR, f"{symbol}_feature_scaler.pkl")
     target_scaler_path = os.path.join(SCALERS_DIR, f"{symbol}_close_scaler.pkl")
     feature_cols_path = os.path.join(SCALERS_DIR, f"{symbol}_feature_cols.pkl")
 
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-    if not os.path.exists(feat_scaler_path):
-        raise FileNotFoundError(f"Feature scaler not found: {feat_scaler_path}")
-    if not os.path.exists(target_scaler_path):
-        raise FileNotFoundError(f"Target scaler not found: {target_scaler_path}")
-    if not os.path.exists(feature_cols_path):
-        raise FileNotFoundError(f"Feature cols file not found: {feature_cols_path}")
+    for p, label in [
+        (model_path, "Model"),
+        (feat_scaler_path, "Feature scaler"),
+        (target_scaler_path, "Target scaler"),
+        (feature_cols_path, "Feature cols"),
+    ]:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"{label} file not found: {p}")
 
-    # --- load aset ---
-    models[symbol] = load_model(model_path)
-    feature_scalers[symbol] = joblib.load(feat_scaler_path)
-    target_scalers[symbol] = joblib.load(target_scaler_path)
-
-    #  pakai joblib.load
-    feature_cols_map[symbol] = joblib.load(feature_cols_path)
-
-
-# =========================
-# FUNGSI FORECAST
-# =========================
+    _models[symbol] = load_model(model_path)
+    _feature_scalers[symbol] = joblib.load(feat_scaler_path)
+    _target_scalers[symbol] = joblib.load(target_scaler_path)
+    _feature_cols_map[symbol] = joblib.load(feature_cols_path)
 
 def forecast_future(
     df: pd.DataFrame,
@@ -121,166 +87,82 @@ def forecast_future(
     days: int = DEFAULT_FORECAST_DAYS,
     lookback: int = LOOKBACK,
 ):
+    
     """
-    Menghasilkan prediksi 'days' ke depan + tanggal HARI BURSA (bukan weekend/libur).
+    Forecast hari bursa ke depan
     """
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-    # --- Ambil fitur & scaling sama seperti saat training ---
-    df_feat = df[feature_cols].copy()
+    missing = [c for c in feature_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Kolom fitur tidak ditemukan di data Yahoo: {missing}")
+
+    df_feat = df[feature_cols].copy().dropna()
+
+    if len(df_feat) < lookback:
+        raise ValueError(f"Data tidak cukup untuk lookback={lookback}. Tersedia: {len(df_feat)} baris.")
+
     scaled_features = feature_scaler.transform(df_feat.values)
 
-    # Window awal: lookback hari terakhir
+    # window awal
     last_window = scaled_features[-lookback:, :]
     preds = []
 
-    # Index kolom 'Close' di dalam feature_cols
+    # indeks kolom Close dalam feature_cols
+    if "Close" not in feature_cols:
+        raise ValueError("feature_cols tidak mengandung 'Close'. Pastikan sama dengan training.")
     close_idx = feature_cols.index("Close")
 
-    # --- Autoregressive forecasting ---
     for _ in range(days):
-        x_in = last_window[np.newaxis, ...]  # shape: (1, lookback, n_features)
-        y_scaled = model.predict(x_in, verbose=0)  # shape: (1, 1)
-        # balik ke skala harga asli
+        x_in = last_window[np.newaxis, ...]             
+        y_scaled = model.predict(x_in, verbose=0)       
+
+        # ke skala harga asli
         y = target_scaler.inverse_transform(y_scaled)[0, 0]
         preds.append(float(y))
 
-        # update window: geser 1 langkah dan masukkan prediksi terbaru
+        # geser window 1 langkah
         new_row = last_window[-1].copy()
+        # masukkan Close yang sudah discale
         new_row[close_idx] = y_scaled[0, 0]
         last_window = np.vstack([last_window[1:], new_row])
 
-    # --- Tanggal prediksi: hanya hari bursa (Mon–Fri, skip libur) ---
-    last_date = df.index[-1].date()  # tanggal data terakhir dari Yahoo Finance
-    trading_dates = generate_trading_days(
-        start_date=last_date,
-        n_days=days,
-        holidays=ID_HOLIDAYS,
-    )
+    # tanggal prediksi: hari bursa
+    last_date = df_feat.index[-1].date()
+    trading_dates = generate_trading_days(last_date, days, holidays=ID_HOLIDAYS)
 
-    results = [
-        {
-            "date": d.isoformat(),
-            "predicted_close": p,
-        }
-        for d, p in zip(trading_dates, preds)
-    ]
-    return results
-
-# =================
-# backtest 1 bulan
-# =================
-
-def backtest_last_month(
-    df: pd.DataFrame,
-    feature_scaler,
-    target_scaler,
-    model,
-    feature_cols,
-    lookback: int = LOOKBACK,
-    backtest_days: int = 22,  # ±1 bulan bursa
-):
-    """
-    Rolling 1-step forecast untuk ±1 bulan terakhir.
-    Untuk setiap tanggal t:
-    - input = data sampai t-1
-    - output = prediksi Close untuk t
-    """
-
-    df_feat = df[feature_cols].copy()
-    scaled_features = feature_scaler.transform(df_feat.values)
-
-    close_idx = feature_cols.index("Close")
-
-    if len(df_feat) < lookback + backtest_days:
-        raise ValueError("Data historis tidak cukup untuk backtest")
-
-    preds = []
-    dates = []
-    actuals = []
-
-    start_i = len(df_feat) - backtest_days
-
-    for i in range(start_i, len(df_feat)):
-        window = scaled_features[i - lookback : i, :]
-        x_in = window[np.newaxis, ...]  # (1, lookback, n_features)
-
-        y_scaled = model.predict(x_in, verbose=0)
-        y_pred = target_scaler.inverse_transform(y_scaled)[0, 0]
-
-        preds.append(float(y_pred))
-        actuals.append(float(df["Close"].iloc[i]))
-        dates.append(df.index[i].strftime("%Y-%m-%d"))
-
-    return {
-        "dates": dates,
-        "predicted_close": preds,
-        "actual_close": actuals,
-    }
-
-# ========================
-# Helper Metriks
-# ========================
-def compute_metrics(actual: np.ndarray, pred: np.ndarray):
-    actual = np.asarray(actual, dtype=float)
-    pred = np.asarray(pred, dtype=float)
-
-    # MAE
-    mae = float(np.mean(np.abs(actual - pred)))
-
-    # RMSE
-    rmse = float(np.sqrt(np.mean((actual - pred) ** 2)))
-
-    # MAPE (hindari div 0)
-    eps = 1e-9
-    mape = float(np.mean(np.abs((actual - pred) / np.maximum(np.abs(actual), eps))) * 100.0)
-
-    return {"mae": mae, "rmse": rmse, "mape": mape}
+    return [{"date": d.isoformat(), "predicted_close": p} for d, p in zip(trading_dates, preds)]
 
 
-# =========================
-# ROUTES FLASK
-# =========================
-
+# Routes
 @app.route("/")
 def home():
-    return "Stock Predictor API (BiLSTM High Precision)"
-
+    return "Stock Predictor API (BiLSTM)"
 
 @app.route("/predict/<symbol>", methods=["GET"])
 def predict_symbol(symbol):
     symbol = symbol.upper()
 
     if symbol not in SUPPORTED_SYMBOLS:
-        return (
-            jsonify(
-                {
-                    "error": f"Symbol {symbol} tidak didukung. Gunakan salah satu dari {SUPPORTED_SYMBOLS}"
-                }
-            ),
-            400,
-        )
+        return jsonify({"error": f"Symbol {symbol} tidak didukung. Gunakan: {SUPPORTED_SYMBOLS}"}), 400
 
     try:
-        # ---- Load model & scaler untuk symbol ini (lazy load) ----
         load_assets_for_symbol(symbol)
 
-        model = models[symbol]
-        feat_scaler = feature_scalers[symbol]
-        tgt_scaler = target_scalers[symbol]
-        feature_cols = feature_cols_map[symbol]
+        model = _models[symbol]
+        feat_scaler = _feature_scalers[symbol]
+        tgt_scaler = _target_scalers[symbol]
+        feature_cols = _feature_cols_map[symbol]
 
-        # ---- Ambil data OHLCV terbaru dari Yahoo Finance ----
-        ticker_yf = symbol + ".JK"  # asumsi di BEI
-        # 5y cukup panjang untuk training & updating
-        df = yf.download(ticker_yf, period="5y", auto_adjust=False).dropna()
+        ticker_yf = symbol + ".JK"
 
-        if df.empty:
-            return (
-                jsonify({"error": f"Tidak ada data dari Yahoo Finance untuk {ticker_yf}"}),
-                500,
-            )
+        # Ambil periode 5 tahun
+        df = yf.download(ticker_yf, period="5y", auto_adjust=False, progress=False).dropna()
 
-        # Pastikan index datetime (kalau belum)
+        if df is None or df.empty:
+            return jsonify({"error": f"Tidak ada data dari Yahoo Finance untuk {ticker_yf}"}), 500
+
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
 
@@ -296,158 +178,40 @@ def predict_symbol(symbol):
             lookback=LOOKBACK,
         )
 
-        response = {
-            "symbol": symbol,
-            "days": days,
-            "predictions": predictions,
-        }
-        return jsonify(response)
+        return jsonify({"symbol": symbol, "days": days, "predictions": predictions})
 
     except Exception as e:
-        # Untuk debugging; di produksi sebaiknya lebih dibatasi
         return jsonify({"error": str(e)}), 500
-
-
-# =========================
-# HISTORY
-# =========================
 
 @app.route("/history/<symbol>", methods=["GET"])
 def history(symbol):
-    try:
-        symbol = symbol.upper()
-        if symbol not in SUPPORTED_SYMBOLS:
-            return jsonify({"error": f"Symbol {symbol} tidak didukung. Gunakan {SUPPORTED_SYMBOLS}"}), 400
+    symbol = symbol.upper()
 
+    if symbol not in SUPPORTED_SYMBOLS:
+        return jsonify({"error": f"Symbol {symbol} tidak didukung. Gunakan: {SUPPORTED_SYMBOLS}"}), 400
+
+    try:
         ticker_yf = symbol + ".JK"
         df = yf.download(ticker_yf, period="2y", auto_adjust=False, progress=False)
 
         if df is None or df.empty:
             return jsonify({"error": f"Tidak ada data untuk {ticker_yf}"}), 500
 
-        # Kalau kolom MultiIndex, rapikan
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
         df = df.dropna()
 
-        # Ambil tanggal dari index (paling aman)
         dates = df.index.strftime("%Y-%m-%d").tolist()
-
-        # Close harus float biasa
         close = df["Close"].astype(float).tolist()
 
         return jsonify({"symbol": symbol, "dates": dates, "close": close})
 
     except Exception as e:
-        # supaya kalau error, keluar JSON bukan HTML
-        return jsonify({"error": str(e)}), 500
-
-# =========================
-# Backtest
-# =========================
-@app.route("/backtest/<symbol>", methods=["GET"])
-def backtest(symbol):
-    try:
-        symbol = symbol.upper()
-        if symbol not in SUPPORTED_SYMBOLS:
-            return jsonify({"error": f"Symbol {symbol} tidak didukung"}), 400
-
-        load_assets_for_symbol(symbol)
-
-        model = models[symbol]
-        feat_scaler = feature_scalers[symbol]
-        tgt_scaler = target_scalers[symbol]
-        feature_cols = feature_cols_map[symbol]
-
-        ticker_yf = symbol + ".JK"
-        df = yf.download(ticker_yf, period="5y", auto_adjust=False, progress=False)
-        df = df.dropna()
-
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index)
-
-        result = backtest_last_month(
-            df=df,
-            feature_scaler=feat_scaler,
-            target_scaler=tgt_scaler,
-            model=model,
-            feature_cols=feature_cols,
-            lookback=LOOKBACK,
-            backtest_days=22,
-        )
-
-        return jsonify({
-            "symbol": symbol,
-            "days": len(result["dates"]),
-            **result
-        })
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ========================
-# Metriks Symbols
-# ========================
-@app.route("/metrics/<symbol>", methods=["GET"])
-def metrics(symbol):
-    try:
-        symbol = symbol.upper()
-        if symbol not in SUPPORTED_SYMBOLS:
-            return jsonify({"error": f"Symbol {symbol} tidak didukung. Gunakan {SUPPORTED_SYMBOLS}"}), 400
-
-        # load model & scaler
-        load_assets_for_symbol(symbol)
-        model = models[symbol]
-        feat_scaler = feature_scalers[symbol]
-        tgt_scaler = target_scalers[symbol]
-        feature_cols = feature_cols_map[symbol]
-
-        # ambil data historis untuk backtest
-        ticker_yf = symbol + ".JK"
-        df = yf.download(ticker_yf, period="5y", auto_adjust=False, progress=False).dropna()
-
-        if df is None or df.empty:
-            return jsonify({"error": f"Tidak ada data untuk {ticker_yf}"}), 500
-
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index)
-
-        # rolling backtest 1 bulan (±22 hari bursa)
-        bt = backtest_last_month(
-            df=df,
-            feature_scaler=feat_scaler,
-            target_scaler=tgt_scaler,
-            model=model,
-            feature_cols=feature_cols,
-            lookback=LOOKBACK,
-            backtest_days=22,
-        )
-
-        metrics_dict = compute_metrics(
-            actual=np.array(bt["actual_close"], dtype=float),
-            pred=np.array(bt["predicted_close"], dtype=float),
-        )
-
-        return jsonify({
-            "symbol": symbol,
-            "window_days": bt["days"] if "days" in bt else len(bt["dates"]),
-            "metrics": metrics_dict,
-            # opsional: kalau mau lihat detailnya juga
-            # "dates": bt["dates"],
-            # "actual_close": bt["actual_close"],
-            # "predicted_close": bt["predicted_close"],
-        })
-
-    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# =========================
-# ENTRY POINT (LOCAL)
-# =========================
-
+# Main
 if __name__ == "__main__":
-    # Untuk running lokal (python inference_api.py)
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=True)
