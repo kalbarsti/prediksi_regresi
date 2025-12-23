@@ -158,7 +158,8 @@ def predict_symbol(symbol):
         ticker_yf = symbol + ".JK"
 
         # Ambil periode 5 tahun
-        df = yf.download(ticker_yf, period="5y", auto_adjust=False, progress=False).dropna()
+        df = yf.download(ticker_yf, period="5y", auto_adjust=True, progress=False).dropna()
+
 
         if df is None or df.empty:
             return jsonify({"error": f"Tidak ada data dari Yahoo Finance untuk {ticker_yf}"}), 500
